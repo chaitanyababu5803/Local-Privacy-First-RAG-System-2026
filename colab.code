@@ -1,0 +1,65 @@
+# 1. INSTALL DEPENDENCIES
+!apt-get update && apt-get install -y zstd
+!pip install -q --no-warn-conflicts chromadb langchain langchain-community langchain-text-splitters sentence-transformers gradio pypdf
+
+import subprocess, time, os, gradio as gr
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.llms import Ollama
+
+# 2. START SERVER
+process = subprocess.Popen(['nohup', 'ollama', 'serve'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+time.sleep(10)
+!ollama pull llama3.2:1b 
+
+# 3. RAG ENGINE (Optimized)
+embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+vector_db = None
+
+def process_file(file):
+    global vector_db
+    loader = PyPDFLoader(file.name) if file.name.endswith('.pdf') else TextLoader(file.name)
+    
+    # INCREASED OVERLAP: This ensures that if a sentence is split, the context remains linked
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200)
+    chunks = text_splitter.split_documents(loader.load())
+    vector_db = Chroma.from_documents(documents=chunks, embedding=embeddings)
+    return f"✅ Indexed {len(chunks)} chunks. System ready."
+
+def ask_llama(question):
+    if not vector_db: return "⚠️ Please upload a document first."
+    
+    # INCREASED RETRIEVAL K: Pulling 4 chunks instead of 2 gives the LLM more "evidence"
+    docs = vector_db.similarity_search(question, k=4)
+    context = "\n---\n".join([d.page_content for d in docs])
+    
+    # REFINED PROMPT: Less restrictive, allowing the AI to summarize if a direct answer is missing
+    llm = Ollama(model="llama3.2:1b")
+    prompt = f"""You are a helpful assistant. Use the provided context to answer the user's question.
+    
+    Context:
+    {context}
+    
+    Question: {question}
+    
+    Instructions:
+    - Answer based ONLY on the context provided.
+    - If the exact answer isn't explicitly in the context, summarize what the document says about the topic instead of just saying "I don't know."
+    """
+    return llm.invoke(prompt)
+
+# 4. UI
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# 🔒 Precision RAG System")
+    with gr.Row():
+        file_input = gr.File(label="Upload PDF", file_types=[".pdf", ".txt"])
+        btn_index = gr.Button("Index Data", variant="primary")
+    chat_input = gr.Textbox(label="Ask a Question")
+    chat_output = gr.Textbox(label="AI Response", interactive=False, lines=5)
+    
+    btn_index.click(process_file, [file_input], [chat_output])
+    chat_input.submit(ask_llama, [chat_input], [chat_output])
+
+demo.launch(share=True)
